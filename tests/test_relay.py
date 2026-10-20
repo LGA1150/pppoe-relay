@@ -82,6 +82,73 @@ def connect_pppoe(fd, interface, mac, sid):
         raise OSError(error, os.strerror(error))
 
 
+def checksum(data):
+    if len(data) % 2:
+        data += b'\0'
+    total = sum(struct.unpack('!' + 'H' * (len(data) // 2), data))
+    while total >> 16:
+        total = (total & 0xffff) + (total >> 16)
+    return (~total) & 0xffff
+
+
+def tcp_packet(family, index, size, port):
+    """An individual, fully checksummed PPP/IP/TCP frame eligible for GRO."""
+    data = bytes((index + offset) % 251 for offset in range(size))
+    if family == 4:
+        source, target = socket.inet_aton('192.0.2.1'), socket.inet_aton('192.0.2.2')
+        pseudo = source + target + struct.pack('!BBH', 0, 6, 20 + size)
+    else:
+        source = socket.inet_pton(socket.AF_INET6, '2001:db8::1')
+        target = socket.inet_pton(socket.AF_INET6, '2001:db8::2')
+        pseudo = source + target + struct.pack('!I3xB', 20 + size, 6)
+    tcp = struct.pack('!HHIIHHHH', port, 443, 1000 + index * size, 1,
+                      0x5010, 65535, 0, 0)
+    tcp = tcp[:16] + struct.pack('!H', checksum(pseudo + tcp + data)) + tcp[18:]
+    if family == 4:
+        ip = struct.pack('!BBHHHBBH4s4s', 0x45, 0, 40 + size, index + 1,
+                         0x4000, 64, 6, 0, source, target)
+        ip = ip[:10] + struct.pack('!H', checksum(ip)) + ip[12:]
+        return b'\x00\x21' + ip + tcp + data
+    ip = struct.pack('!IHBB16s16s', 6 << 28, 20 + size, 6, 64, source, target)
+    return b'\x00\x57' + ip + tcp + data
+
+
+def send_batch(fd, frames):
+    """Submit only ordinary Ethernet frames, never prebuilt GSO packets."""
+    class Iovec(ctypes.Structure):
+        _fields_ = [('base', ctypes.c_void_p), ('length', ctypes.c_size_t)]
+
+    class Msghdr(ctypes.Structure):
+        _fields_ = [('name', ctypes.c_void_p), ('namelen', ctypes.c_uint),
+                    ('iov', ctypes.POINTER(Iovec)), ('iovlen', ctypes.c_size_t),
+                    ('control', ctypes.c_void_p), ('controllen', ctypes.c_size_t),
+                    ('flags', ctypes.c_int)]
+
+    class Mmsghdr(ctypes.Structure):
+        _fields_ = [('header', Msghdr), ('length', ctypes.c_uint)]
+
+    buffers = [ctypes.create_string_buffer(frame) for frame in frames]
+    vectors = (Iovec * len(frames))(*(Iovec(ctypes.addressof(buf), len(frame))
+                                     for buf, frame in zip(buffers, frames)))
+    messages = (Mmsghdr * len(frames))()
+    for index in range(len(vectors)):
+        messages[index].header.iov = ctypes.pointer(vectors[index])
+        messages[index].header.iovlen = 1
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.sendmmsg.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint, ctypes.c_int]
+    libc.sendmmsg.restype = ctypes.c_int
+    sent = 0
+    while sent < len(frames):
+        count = libc.sendmmsg(fd.fileno(), ctypes.byref(messages, sent * ctypes.sizeof(Mmsghdr)),
+                             len(frames) - sent, 0)
+        if count < 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+        if not count:
+            raise RuntimeError('sendmmsg made no progress')
+        sent += count
+
+
 class Port:
     def __init__(self, name):
         self.sockets = {}
@@ -118,7 +185,7 @@ class Port:
             if sid is not None and sid != received_sid:
                 continue
             return dict(destination=data[:6], source=data[6:12], code=received_code,
-                        sid=received_sid, payload=data[20:20 + length])
+                        sid=received_sid, payload=data[20:20 + length], wire_length=len(data))
         raise TimeoutError(f'no packet protocol={protocol:#x} code={code} sid={sid}')
 
 
@@ -305,6 +372,106 @@ class RelayTest(unittest.TestCase):
                 except subprocess.TimeoutExpired:
                     peer.kill()
                     peer.communicate()
+
+    @unittest.skipUnless(os.environ.get('PPPOE_RELAY_GRO') == '1',
+                         'set PPPOE_RELAY_GRO=1 to run GRO tests (requires ethtool)')
+    def test_gro_forwarding(self):
+        session = self.session()
+        # Force standard-sized input frames and software segmentation on output.
+        # Disable GRO at the destination so its capture sees final wire frames.
+        for ns, dev in ((NAMES[0], 'eth0'), (NAMES[2], 'eth0'),
+                        (NAMES[1], 'c0'), (NAMES[1], 's0')):
+            command('ip', 'netns', 'exec', ns, 'ethtool', '-K', dev,
+                    'tso', 'off', 'gso', 'off', 'tx', 'off', 'gro', 'off')
+            features = command('ip', 'netns', 'exec', ns, 'ethtool', '-k', dev)
+            for feature in ('tcp-segmentation-offload', 'generic-segmentation-offload',
+                            'tx-checksumming', 'generic-receive-offload'):
+                self.assertRegex(features, rf'(?m)^{feature}: off(?:\s|$)')
+        os.kill(self.process.pid, signal.SIGSTOP)
+        try:
+            for fraglist in (False, True):
+                for dev in ('c0', 's0'):
+                    command('ip', 'netns', 'exec', NAMES[1], 'ethtool', '-K', dev,
+                            'gro', 'on', 'rx-gro-list', 'on' if fraglist else 'off')
+                    features = command('ip', 'netns', 'exec', NAMES[1], 'ethtool', '-k', dev)
+                    self.assertRegex(features, r'(?m)^generic-receive-offload: on(?:\s|$)')
+                    self.assertRegex(features, rf'(?m)^rx-gro-list: {"on" if fraglist else "off"}(?:\s|$)')
+                    # Veth normally polls after each send. Coalesce across
+                    # polls so this test does not depend on scheduling luck.
+                    command('ip', 'netns', 'exec', NAMES[1], 'python3', '-c',
+                            'from pathlib import Path; import sys; '
+                            'p = Path("/sys/class/net") / sys.argv[1]; '
+                            '(p / "gro_flush_timeout").write_text("10000000"); '
+                            '(p / "napi_defer_hard_irqs").write_text("10")', dev)
+                for family in (4, 6):
+                    for reverse in (False, True):
+                        with self.subTest(fraglist=fraglist, family=family, reverse=reverse):
+                            self.gro_transfer(session, family, reverse, fraglist)
+        finally:
+            os.kill(self.process.pid, signal.SIGCONT)
+            for dev in ('c0', 's0'):
+                command('ip', 'netns', 'exec', NAMES[1], 'ethtool', '-K', dev,
+                        'gro', 'off', 'rx-gro-list', 'off')
+
+    def gro_transfer(self, session, family, reverse, fraglist):
+        source, target = (self.server, self.client) if reverse else (self.client, self.server)
+        source_mac, relay_mac, target_mac = ((SERVER, RELAY_S, CLIENT) if reverse
+                                             else (CLIENT, RELAY_C, SERVER))
+        input_sid = session['server_sid'] if reverse else session['client_sid']
+        output_sid = session['client_sid'] if reverse else session['server_sid']
+        size = 1452 if family == 4 else 1432
+        count = 64
+        port = 40000 + family * 10 + int(reverse) + 2 * int(fraglist)
+        payloads = [tcp_packet(family, index, size, port) for index in range(count)]
+        frames = [relay_mac + source_mac + struct.pack('!HBBHH', SESS, 0x11, 0,
+                                                      input_sid, len(payload)) + payload
+                  for payload in payloads]
+        self.assertTrue(all(len(frame) == 1514 for frame in frames))
+        # A protocol-specific AF_PACKET tap sees ingress after GRO. VNET_HDR
+        # exposes gso_type/gso_size, proving actual aggregation rather than
+        # merely testing an interface with the GRO feature enabled.
+        with namespace(NAMES[1]):
+            capture = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(SESS))
+            capture.bind(('s0' if reverse else 'c0', 0))
+            capture.setsockopt(263, 23, 1)  # PACKET_IGNORE_OUTGOING
+            capture.setsockopt(263, 15, 1)  # PACKET_VNET_HDR
+            capture.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+        self.addCleanup(capture.close)
+        target.sockets[SESS].setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+        send_batch(source.sockets[SESS], frames)
+        received = []
+        for expected in payloads:
+            packet = target.receive(SESS, sid=output_sid)
+            self.assertEqual(packet['source'], RELAY_C if reverse else RELAY_S)
+            self.assertEqual(packet['destination'], target_mac)
+            self.assertEqual(packet['payload'], expected)
+            self.assertEqual(packet['wire_length'], 1514)
+            received.append(packet)
+        aggregated = []
+        represented = 0
+        capture.settimeout(3)
+        while represented < count:
+            data = capture.recv(131072)
+            _, gso_type, _, gso_size, _, _ = struct.unpack('=BBHHHH', data[:10])
+            frame = data[10:]
+            self.assertEqual(frame[:12], relay_mac + source_mac)
+            self.assertEqual(struct.unpack('!H', frame[16:18])[0], input_sid)
+            self.assertEqual(struct.unpack('!H', frame[18:20])[0], len(frame) - 20)
+            if gso_type:
+                self.assertEqual(gso_type, 1 if family == 4 else 4)
+                self.assertEqual(gso_size, size)
+                self.assertGreater(len(frame), 1514)
+                aggregated.append(len(frame))
+            tcp_data = len(frame) - 14 - 6 - 2 - (20 if family == 4 else 40) - 20
+            self.assertEqual(tcp_data % size, 0)
+            represented += tcp_data // size
+        self.assertEqual(represented, count)
+        self.assertTrue(aggregated, 'no GRO aggregation occurred')
+        self.expect_no_packet(target, SESS)
+        print(f'\nGRO IPv{family} {"AC->client" if reverse else "client->AC"} '
+              f'fraglist={fraglist}: {len(aggregated)} aggregates, max={max(aggregated)}, '
+              f'{len(received)}/{count} frames match', flush=True)
+        capture.close()
 
     def test_duplicate_pads_reuses_channels(self):
         session = self.session()

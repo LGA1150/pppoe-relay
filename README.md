@@ -115,11 +115,26 @@ To include interoperability with an RP-PPPoE client:
 sudo env RP_PPPOE=/usr/sbin/pppoe make check
 ```
 
-Without `RP_PPPOE`, only that optional interoperability case is skipped.
+Without `RP_PPPOE`, the optional interoperability case is skipped.
 `PPPOE_RELAY` and `PPPOE_RELAY_PEER` can override the relay and test-peer binaries.
 
-The 15 tests cover discovery and tag preservation, byte-for-byte PPP control/data
-forwarding while the relay process is stopped with SIGSTOP, real IPv4/IPv6 ping,
+To also verify GRO forwarding, use a kernel with PPPoE GRO/GSO support, install
+`ethtool` and enable the optional test:
+
+```sh
+sudo env PPPOE_RELAY_GRO=1 RP_PPPOE=/usr/sbin/pppoe make check
+```
+
+The GRO test sends 64 ordinary, fully checksummed TCP packets per case, covering
+IPv4 and IPv6 in both directions with `rx-gro-list` off and on. An ingress capture
+with `PACKET_VNET_HDR` must observe aggregated packets and valid GSO metadata.
+With egress segmentation and checksum calculation forced to software and
+destination GRO disabled, every resulting frame must match the original IP/TCP
+packet byte for byte, including checksums, with translated MAC addresses and
+session IDs. The relay process is suspended during traffic forwarding.
+
+The other 15 tests cover discovery and tag preservation, byte-for-byte PPP
+control/data forwarding while the relay process is stopped with SIGSTOP, real IPv4/IPv6 ping,
 RP-PPPoE client discovery, duplicate and error PADS, session collisions, capacity
 recovery, partial-setup rollback, malformed discovery, spoofed peers, PADT in
 both directions, descriptor reuse, channel closure, link failure and shutdown.
